@@ -1,0 +1,271 @@
+From 3686b6292473658a16ace61fdbb1ac37439476af Mon Sep 17 00:00:00 2001
+From: Vaishnav M A <mavaishnav007@gmail.com>
+Date: Tue, 13 Oct 2020 18:48:39 +0530
+Subject: [PATCH] Serdev Changes WIP
+
+Apply https://lore.kernel.org/lkml/20180611115240.32606-21-ricardo.ribalda@gmail.com/T/#mf9855eaba754b6b44c2a86d805b47577076e7e01
+partially
+
+Signed-off-by: Vaishnav M A <mavaishnav007@gmail.com>
+---
+ drivers/tty/serdev/core.c         | 109 ++++++++++++++++++++++++++++--
+ include/linux/mod_devicetable.h   |  10 +++
+ include/linux/serdev.h            |   3 +
+ scripts/mod/devicetable-offsets.c |   3 +-
+ scripts/mod/file2alias.c          |  12 ++++
+ 5 files changed, 132 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/tty/serdev/core.c b/drivers/tty/serdev/core.c
+index c5f0d936b003..a670e2c9a1c9 100644
+--- a/drivers/tty/serdev/core.c
++++ b/drivers/tty/serdev/core.c
+@@ -27,12 +27,17 @@ static ssize_t modalias_show(struct device *dev,
+ 			     struct device_attribute *attr, char *buf)
+ {
+ 	int len;
++	struct serdev_device *serdev = to_serdev_device(dev);
+ 
+ 	len = acpi_device_modalias(dev, buf, PAGE_SIZE - 1);
+ 	if (len != -ENODEV)
+ 		return len;
+ 
+-	return of_device_modalias(dev, buf, PAGE_SIZE);
++	len = of_device_modalias(dev, buf, PAGE_SIZE);
++	if (len != -ENODEV)
++		return len;
++
++	return sprintf(buf, "%s%s\n", SERDEV_MODULE_PREFIX, serdev->modalias);
+ }
+ static DEVICE_ATTR_RO(modalias);
+ 
+@@ -45,14 +50,18 @@ ATTRIBUTE_GROUPS(serdev_device);
+ static int serdev_device_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	int rc;
+-
++struct serdev_device *serdev = to_serdev_device(dev);
+ 	/* TODO: platform modalias */
+ 
+ 	rc = acpi_device_uevent_modalias(dev, env);
+ 	if (rc != -ENODEV)
+ 		return rc;
+ 
+-	return of_device_uevent_modalias(dev, env);
++	if (rc != of_device_uevent_modalias(dev, env))
++		return rc;
++
++	return add_uevent_var(env, "MODALIAS=%s%s", SERDEV_MODULE_PREFIX,
++						    serdev->modalias);
+ }
+ 
+ static void serdev_device_release(struct device *dev)
+@@ -79,12 +88,98 @@ static void serdev_ctrl_release(struct device *dev)
+ 	kfree(ctrl);
+ }
+ 
++static ssize_t
++new_device_store(struct device *dev, struct device_attribute *attr,
++			const char *buf, size_t count)
++{
++	struct serdev_controller *ctrl = to_serdev_controller(dev);
++	struct serdev_device *serdev;
++	char *nline;
++	int len;
++	int err;
++
++	serdev = serdev_device_alloc(ctrl);
++	if (!serdev)
++		return -ENOMEM;
++
++	nline = strchr(buf, '\n');
++	if (nline)
++		len = nline - buf;
++	else
++		len = strlen(buf);
++	len = min(SERDEV_NAME_SIZE - 1, len);
++
++	strncpy(serdev->modalias, buf, len);
++	serdev->modalias[len] = '\0';
++
++	err = serdev_device_add(serdev);
++	if (err) {
++		serdev_device_put(serdev);
++		return err;
++	}
++
++	return count;
++}
++static DEVICE_ATTR_WO(new_device);
++
++static ssize_t
++delete_device_store(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	struct serdev_controller *ctrl = to_serdev_controller(dev);
++	struct serdev_device *serdev = ctrl->serdev;
++	char *nline;
++	int len;
++
++	nline = strchr(buf, '\n');
++	if (nline)
++		len = nline - buf;
++	else
++		len = strlen(buf);
++	len = min(SERDEV_NAME_SIZE - 1, len);
++
++	if (!ctrl->serdev ||
++	    strncmp(dev_name(&serdev->dev), buf, len))
++		return -ENODEV;
++
++	serdev_device_remove(serdev);
++
++	return count;
++}
++static DEVICE_ATTR_IGNORE_LOCKDEP(delete_device, 0200, NULL,
++				  delete_device_store);
++
++static struct attribute *serdev_ctrl_attrs[] = {
++	&dev_attr_new_device.attr,
++	&dev_attr_delete_device.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(serdev_ctrl);
++
++
+ static const struct device_type serdev_ctrl_type = {
++	.groups		= serdev_ctrl_groups,
+ 	.release	= serdev_ctrl_release,
+ };
+ 
++
++static int serdev_match_id(const struct serdev_device_id *id,
++			   const struct serdev_device *sdev)
++{
++	while (id->name[0]) {
++		if (!strcmp(sdev->modalias, id->name))
++			return 1;
++		id++;
++	}
++
++	return 0;
++}
++
+ static int serdev_device_match(struct device *dev, struct device_driver *drv)
+ {
++	const struct serdev_device *sdev = to_serdev_device(dev);
++	const struct serdev_device_driver *sdrv = to_serdev_device_driver(drv);
++
+ 	if (!is_serdev_device(dev))
+ 		return 0;
+ 
+@@ -92,7 +187,13 @@ static int serdev_device_match(struct device *dev, struct device_driver *drv)
+ 	if (acpi_driver_match_device(dev, drv))
+ 		return 1;
+ 
+-	return of_driver_match_device(dev, drv);
++	if (of_driver_match_device(dev, drv))
++		return 1;
++
++	if (sdrv->id_table)
++		return serdev_match_id(sdrv->id_table, sdev);
++
++	return strcmp(sdev->modalias, drv->name) == 0;
+ }
+ 
+ /**
+diff --git a/include/linux/mod_devicetable.h b/include/linux/mod_devicetable.h
+index e14cbe444afc..22aabcf8cebd 100644
+--- a/include/linux/mod_devicetable.h
++++ b/include/linux/mod_devicetable.h
+@@ -494,6 +494,16 @@ struct spi_device_id {
+ 	kernel_ulong_t driver_data;	/* Data private to the driver */
+ };
+ 
++/* serdev */
++
++#define SERDEV_NAME_SIZE	32
++#define SERDEV_MODULE_PREFIX	"serdev:"
++
++struct serdev_device_id {
++	char name[SERDEV_NAME_SIZE];
++	kernel_ulong_t driver_data;	/* Data private to the driver */
++};
++
+ /* SLIMbus */
+ 
+ #define SLIMBUS_NAME_SIZE	32
+diff --git a/include/linux/serdev.h b/include/linux/serdev.h
+index 9f14f9c12ec4..48d601f0add9 100644
+--- a/include/linux/serdev.h
++++ b/include/linux/serdev.h
+@@ -9,6 +9,7 @@
+ #include <linux/device.h>
+ #include <linux/termios.h>
+ #include <linux/delay.h>
++#include <linux/mod_devicetable.h>
+ 
+ struct serdev_controller;
+ struct serdev_device;
+@@ -45,6 +46,7 @@ struct serdev_device {
+ 	const struct serdev_device_ops *ops;
+ 	struct completion write_comp;
+ 	struct mutex write_lock;
++char modalias[SERDEV_NAME_SIZE];
+ };
+ 
+ static inline struct serdev_device *to_serdev_device(struct device *d)
+@@ -60,6 +62,7 @@ static inline struct serdev_device *to_serdev_device(struct device *d)
+  * @remove:	unbinds this driver from the serdev device.
+  */
+ struct serdev_device_driver {
++	const struct serdev_device_id *id_table;
+ 	struct device_driver driver;
+ 	int	(*probe)(struct serdev_device *);
+ 	void	(*remove)(struct serdev_device *);
+diff --git a/scripts/mod/devicetable-offsets.c b/scripts/mod/devicetable-offsets.c
+index 010be8ba2116..85fc86f9d37b 100644
+--- a/scripts/mod/devicetable-offsets.c
++++ b/scripts/mod/devicetable-offsets.c
+@@ -151,7 +151,8 @@ int main(void)
+ 	DEVID_FIELD(i3c_device_id, manuf_id);
+ 	DEVID_FIELD(i3c_device_id, part_id);
+ 	DEVID_FIELD(i3c_device_id, extra_info);
+-
++	DEVID(serdev_device_id);
++	DEVID_FIELD(serdev_device_id, name);
+ 	DEVID(spi_device_id);
+ 	DEVID_FIELD(spi_device_id, name);
+ 
+diff --git a/scripts/mod/file2alias.c b/scripts/mod/file2alias.c
+index 9599e2a3f1e6..ce43a5325971 100644
+--- a/scripts/mod/file2alias.c
++++ b/scripts/mod/file2alias.c
+@@ -919,6 +919,17 @@ static int do_i2c_entry(const char *filename, void *symval,
+ 	return 1;
+ }
+ 
++/* Looks like: serdev:S */
++static int do_serdev_entry(const char *filename, void *symval,
++			   char *alias)
++{
++	DEF_FIELD_ADDR(symval, serdev_device_id, name);
++	sprintf(alias, SERDEV_MODULE_PREFIX "%s", *name);
++
++	return 1;
++}
++
++
+ static int do_i3c_entry(const char *filename, void *symval,
+ 			char *alias)
+ {
+@@ -1415,6 +1426,7 @@ static const struct devtable devtable[] = {
+ 	{"vmbus", SIZE_hv_vmbus_device_id, do_vmbus_entry},
+ 	{"rpmsg", SIZE_rpmsg_device_id, do_rpmsg_entry},
+ 	{"i2c", SIZE_i2c_device_id, do_i2c_entry},
++        {"serdev", SIZE_serdev_device_id, do_serdev_entry},
+ 	{"i3c", SIZE_i3c_device_id, do_i3c_entry},
+ 	{"spi", SIZE_spi_device_id, do_spi_entry},
+ 	{"dmi", SIZE_dmi_system_id, do_dmi_entry},
+-- 
+2.25.1
+
