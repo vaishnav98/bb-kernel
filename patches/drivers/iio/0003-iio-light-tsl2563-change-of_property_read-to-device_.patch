@@ -1,0 +1,51 @@
+From a2e9b2bba00c5aabf12473a1ea5d34276981cab4 Mon Sep 17 00:00:00 2001
+From: Vaishnav M A <vaishnav@beagleboard.org>
+Date: Thu, 15 Oct 2020 16:12:05 +0530
+Subject: [PATCH 3/6] iio: light: tsl2563 change of_property_read to
+ device_property_read
+
+This patch aims to replace the of_property_read_u32 for reading
+the amstaos,cover-comp-gain property with device_property_read_u32
+
+Signed-off-by: Vaishnav M A <mavaishnav007@gmail.com>
+Signed-off-by: Vaishnav M A <vaishnav@beagleboard.org>
+---
+ drivers/iio/light/tsl2563.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/iio/light/tsl2563.c b/drivers/iio/light/tsl2563.c
+index abc8d7db8dc1..1f1b8b7cefa4 100644
+--- a/drivers/iio/light/tsl2563.c
++++ b/drivers/iio/light/tsl2563.c
+@@ -703,7 +703,6 @@ static int tsl2563_probe(struct i2c_client *client,
+ 	struct iio_dev *indio_dev;
+ 	struct tsl2563_chip *chip;
+ 	struct tsl2563_platform_data *pdata = client->dev.platform_data;
+-	struct device_node *np = client->dev.of_node;
+ 	int err = 0;
+ 	u8 id = 0;
+ 
+@@ -738,13 +737,14 @@ static int tsl2563_probe(struct i2c_client *client,
+ 	chip->calib0 = tsl2563_calib_from_sysfs(CALIB_BASE_SYSFS);
+ 	chip->calib1 = tsl2563_calib_from_sysfs(CALIB_BASE_SYSFS);
+ 
+-	if (pdata)
++	if (pdata) {
+ 		chip->cover_comp_gain = pdata->cover_comp_gain;
+-	else if (np)
+-		of_property_read_u32(np, "amstaos,cover-comp-gain",
+-				     &chip->cover_comp_gain);
+-	else
+-		chip->cover_comp_gain = 1;
++	} else {
++		err = device_property_read_u32(&client->dev, "amstaos,cover-comp-gain",
++					       &chip->cover_comp_gain);
++		if (err)
++			chip->cover_comp_gain = 1;
++	}
+ 
+ 	dev_info(&client->dev, "model %d, rev. %d\n", id >> 4, id & 0x0f);
+ 	indio_dev->name = client->name;
+-- 
+2.25.1
+

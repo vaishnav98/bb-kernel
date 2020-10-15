@@ -1,0 +1,48 @@
+From dc24aca29a3bc616d182efd23402e393e3068678 Mon Sep 17 00:00:00 2001
+From: Vaishnav M A <vaishnav@beagleboard.org>
+Date: Thu, 15 Oct 2020 16:12:07 +0530
+Subject: [PATCH 6/6] iio: proximity: as3935 change of_property_read to
+ device_property_read
+
+This patch aims to replace the of_property_read_u32 for reading
+the ams,tuning-capacitor-pf, ams,nflwdth properties with
+device_property_read_u32
+
+Signed-off-by: Vaishnav M A <vaishnav@beagleboard.org>
+---
+ drivers/iio/proximity/as3935.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/iio/proximity/as3935.c b/drivers/iio/proximity/as3935.c
+index c339e7339ec8..7e47ddf89a56 100644
+--- a/drivers/iio/proximity/as3935.c
++++ b/drivers/iio/proximity/as3935.c
+@@ -355,7 +355,6 @@ static int as3935_probe(struct spi_device *spi)
+ 	struct iio_dev *indio_dev;
+ 	struct iio_trigger *trig;
+ 	struct as3935_state *st;
+-	struct device_node *np = spi->dev.of_node;
+ 	int ret;
+ 
+ 	/* Be sure lightning event interrupt is specified */
+@@ -374,7 +373,7 @@ static int as3935_probe(struct spi_device *spi)
+ 	spi_set_drvdata(spi, indio_dev);
+ 	mutex_init(&st->lock);
+ 
+-	ret = of_property_read_u32(np,
++	ret = device_property_read_u32(&spi->dev,
+ 			"ams,tuning-capacitor-pf", &st->tune_cap);
+ 	if (ret) {
+ 		st->tune_cap = 0;
+@@ -390,7 +389,7 @@ static int as3935_probe(struct spi_device *spi)
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = of_property_read_u32(np,
++	ret = device_property_read_u32(&spi->dev,
+ 			"ams,nflwdth", &st->nflwdth_reg);
+ 	if (!ret && st->nflwdth_reg > AS3935_NFLWDTH_MASK) {
+ 		dev_err(&spi->dev,
+-- 
+2.25.1
+

@@ -1,0 +1,64 @@
+From 73d3583281f6c4f8d343752f689cc4150d1ec093 Mon Sep 17 00:00:00 2001
+From: Vaishnav M A <vaishnav@beagleboard.org>
+Date: Thu, 15 Oct 2020 16:12:04 +0530
+Subject: [PATCH 2/6] Add serdev_device_id for ubx driver
+
+This patch aims to add the serdev_device_id for the ubx
+driver as well as changes the fetching device speed(baud rate)
+from device tree based to unified device properties interface
+
+Signed-off-by: Vaishnav M A <mavaishnav007@gmail.com>
+Signed-off-by: Vaishnav M A <vaishnav@beagleboard.org>
+---
+ drivers/gnss/serial.c |  4 +---
+ drivers/gnss/ubx.c    | 10 ++++++++++
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gnss/serial.c b/drivers/gnss/serial.c
+index def64b36d994..13f7644b5d4f 100644
+--- a/drivers/gnss/serial.c
++++ b/drivers/gnss/serial.c
+@@ -110,11 +110,9 @@ static int gnss_serial_set_power(struct gnss_serial *gserial,
+ static int gnss_serial_parse_dt(struct serdev_device *serdev)
+ {
+ 	struct gnss_serial *gserial = serdev_device_get_drvdata(serdev);
+-	struct device_node *node = serdev->dev.of_node;
+ 	u32 speed = 4800;
+ 
+-	of_property_read_u32(node, "current-speed", &speed);
+-
++	device_property_read_u32(&serdev->dev, "current-speed", &speed);
+ 	gserial->speed = speed;
+ 
+ 	return 0;
+diff --git a/drivers/gnss/ubx.c b/drivers/gnss/ubx.c
+index 7b05bc40532e..2ba8a9f5e57f 100644
+--- a/drivers/gnss/ubx.c
++++ b/drivers/gnss/ubx.c
+@@ -138,6 +138,15 @@ static const struct of_device_id ubx_of_match[] = {
+ MODULE_DEVICE_TABLE(of, ubx_of_match);
+ #endif
+ 
++static const struct serdev_device_id ubx_serdev_id[] = {
++	{ "neo-6m", },
++	{ "neo-8", },
++	{ "neo-m8", },
++	{ "gnss-ubx", },
++	{}
++};
++MODULE_DEVICE_TABLE(serdev, ubx_serdev_id);
++
+ static struct serdev_device_driver ubx_driver = {
+ 	.driver	= {
+ 		.name		= "gnss-ubx",
+@@ -146,6 +155,7 @@ static struct serdev_device_driver ubx_driver = {
+ 	},
+ 	.probe	= ubx_probe,
+ 	.remove	= ubx_remove,
++	.id_table = ubx_serdev_id,
+ };
+ module_serdev_device_driver(ubx_driver);
+ 
+-- 
+2.25.1
+

@@ -1,0 +1,583 @@
+From 52a34195fbd8277fcfbd618cbb869ae0869c64a2 Mon Sep 17 00:00:00 2001
+From: Vaishnav M A <vaishnav@beagleboard.org>
+Date: Thu, 15 Oct 2020 16:12:03 +0530
+Subject: [PATCH 1/6] Dynamically load/remove serdev devices
+
+This patch is a combined version of this original patch modified
+for 5.9 with a fex added fixes.
+
+https://lore.kernel.org/lkml/20180611115240.32606-21-ricardo.ribalda@gmail.com/T/
+
+The Fixes added apart from the original patch is as follows:
+	* not add a ttydev device to all serdev controllers
+	* fix serdev_device_uevent
+	* fix restore/change ttyport client ops
+
+Signed-off-by: Ricardo Ribalda Delgado <ricardo.ribalda@gmail.com>
+Signed-off-by: Vaishnav M A <mavaishnav007@gmail.com>
+Signed-off-by: Vaishnav M A <vaishnav@beagleboard.org>
+---
+ drivers/tty/serdev/Kconfig          |  10 ++
+ drivers/tty/serdev/Makefile         |   2 +
+ drivers/tty/serdev/core.c           | 164 ++++++++++++++++++++++++----
+ drivers/tty/serdev/serdev-ttydev.c  |  83 ++++++++++++++
+ drivers/tty/serdev/serdev-ttyport.c |  11 +-
+ drivers/tty/serdev/serport.h        |  16 +++
+ include/linux/mod_devicetable.h     |  10 ++
+ include/linux/serdev.h              |  11 ++
+ scripts/mod/devicetable-offsets.c   |   3 +
+ scripts/mod/file2alias.c            |  11 ++
+ 10 files changed, 294 insertions(+), 27 deletions(-)
+ create mode 100644 drivers/tty/serdev/serdev-ttydev.c
+ create mode 100644 drivers/tty/serdev/serport.h
+
+diff --git a/drivers/tty/serdev/Kconfig b/drivers/tty/serdev/Kconfig
+index 46ae732bfc68..bb9b9c2bce9a 100644
+--- a/drivers/tty/serdev/Kconfig
++++ b/drivers/tty/serdev/Kconfig
+@@ -22,4 +22,14 @@ config SERIAL_DEV_CTRL_TTYPORT
+ 	depends on SERIAL_DEV_BUS != m
+ 	default y
+ 
++config SERIAL_DEV_CTRL_TTYDEV
++	tristate "TTY port dynamically loaded by the Serial Device Bus"
++	help
++	  Say Y here if you want to create a bridge driver between the Serial
++	  device bus and the TTY chardevice. This driver can be dynamically
++	  loaded/unloaded by the Serial Device Bus.
++
++	  If unsure, say N.
++	depends on SERIAL_DEV_CTRL_TTYPORT
++
+ endif
+diff --git a/drivers/tty/serdev/Makefile b/drivers/tty/serdev/Makefile
+index 078417e5b068..d49b668f1e04 100644
+--- a/drivers/tty/serdev/Makefile
++++ b/drivers/tty/serdev/Makefile
+@@ -4,3 +4,5 @@ serdev-objs := core.o
+ obj-$(CONFIG_SERIAL_DEV_BUS) += serdev.o
+ 
+ obj-$(CONFIG_SERIAL_DEV_CTRL_TTYPORT) += serdev-ttyport.o
++
++obj-$(CONFIG_SERIAL_DEV_CTRL_TTYDEV) += serdev-ttydev.o
+diff --git a/drivers/tty/serdev/core.c b/drivers/tty/serdev/core.c
+index c5f0d936b003..7e912a504c89 100644
+--- a/drivers/tty/serdev/core.c
++++ b/drivers/tty/serdev/core.c
+@@ -21,18 +21,23 @@
+ #include <linux/platform_data/x86/apple.h>
+ 
+ static bool is_registered;
+-static DEFINE_IDA(ctrl_ida);
++static DEFINE_IDR(ctrl_idr);
+ 
+ static ssize_t modalias_show(struct device *dev,
+ 			     struct device_attribute *attr, char *buf)
+ {
+ 	int len;
++	struct serdev_device *serdev = to_serdev_device(dev);
+ 
+ 	len = acpi_device_modalias(dev, buf, PAGE_SIZE - 1);
+ 	if (len != -ENODEV)
+ 		return len;
+ 
+-	return of_device_modalias(dev, buf, PAGE_SIZE);
++	len = of_device_modalias(dev, buf, PAGE_SIZE);
++	if (len != -ENODEV)
++		return len;
++
++	return sprintf(buf, "%s%s\n", SERDEV_MODULE_PREFIX, serdev->modalias);
+ }
+ static DEVICE_ATTR_RO(modalias);
+ 
+@@ -45,14 +50,19 @@ ATTRIBUTE_GROUPS(serdev_device);
+ static int serdev_device_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+ 	int rc;
+-
++	struct serdev_device *serdev = to_serdev_device(dev);
+ 	/* TODO: platform modalias */
+ 
+ 	rc = acpi_device_uevent_modalias(dev, env);
+ 	if (rc != -ENODEV)
+ 		return rc;
+ 
+-	return of_device_uevent_modalias(dev, env);
++	rc = of_device_uevent_modalias(dev, env);
++	if (rc != -ENODEV)
++		return rc;
++
++	return add_uevent_var(env, "MODALIAS=%s%s", SERDEV_MODULE_PREFIX,
++						    serdev->modalias);
+ }
+ 
+ static void serdev_device_release(struct device *dev)
+@@ -75,16 +85,103 @@ static bool is_serdev_device(const struct device *dev)
+ static void serdev_ctrl_release(struct device *dev)
+ {
+ 	struct serdev_controller *ctrl = to_serdev_controller(dev);
+-	ida_simple_remove(&ctrl_ida, ctrl->nr);
++	
++	idr_remove(&ctrl_idr, ctrl->nr);
+ 	kfree(ctrl);
+ }
+ 
++static ssize_t
++new_device_store(struct device *dev, struct device_attribute *attr,
++			const char *buf, size_t count)
++{
++	struct serdev_controller *ctrl = to_serdev_controller(dev);
++	struct serdev_device *serdev;
++	char *nline;
++	int len;
++	int err;
++
++	serdev = serdev_device_alloc(ctrl);
++	if (!serdev)
++		return -ENOMEM;
++
++	nline = strchr(buf, '\n');
++	if (nline)
++		len = nline - buf + 1;
++	else
++		len = count;
++	len = min(SERDEV_NAME_SIZE, len);
++
++	strscpy(serdev->modalias, buf, len);
++
++	err = serdev_device_add(serdev);
++	if (err) {
++		serdev_device_put(serdev);
++		return err;
++	}
++
++	return count;
++}
++static DEVICE_ATTR_WO(new_device);
++
++static ssize_t
++delete_device_store(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	struct serdev_controller *ctrl = to_serdev_controller(dev);
++	struct serdev_device *serdev = ctrl->serdev;
++	char *nline;
++	int len;
++
++	nline = strchr(buf, '\n');
++	if (nline)
++		len = nline - buf;
++	else
++		len = strlen(buf);
++	len = min(SERDEV_NAME_SIZE - 1, len);
++
++	if (!ctrl->serdev ||
++	    strncmp(dev_name(&serdev->dev), buf, len))
++		return -ENODEV;
++
++	serdev_device_remove(serdev);
++
++	return count;
++}
++static DEVICE_ATTR_IGNORE_LOCKDEP(delete_device, 0200, NULL,
++				  delete_device_store);
++
++static struct attribute *serdev_ctrl_attrs[] = {
++	&dev_attr_new_device.attr,
++	&dev_attr_delete_device.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(serdev_ctrl);
++
++
+ static const struct device_type serdev_ctrl_type = {
++	.groups		= serdev_ctrl_groups,
+ 	.release	= serdev_ctrl_release,
+ };
+ 
++
++const struct serdev_device_id *serdev_match_id(const struct serdev_device_id *id,
++			   const struct serdev_device *sdev)
++{
++	while (id->name[0]) {
++		if (!strcmp(sdev->modalias, id->name))
++			return id;
++		id++;
++	}
++
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(serdev_match_id);
++
+ static int serdev_device_match(struct device *dev, struct device_driver *drv)
+ {
++	const struct serdev_device *sdev = to_serdev_device(dev);
++	const struct serdev_device_driver *sdrv = to_serdev_device_driver(drv);
++
+ 	if (!is_serdev_device(dev))
+ 		return 0;
+ 
+@@ -92,7 +189,13 @@ static int serdev_device_match(struct device *dev, struct device_driver *drv)
+ 	if (acpi_driver_match_device(dev, drv))
+ 		return 1;
+ 
+-	return of_driver_match_device(dev, drv);
++	if (of_driver_match_device(dev, drv))
++		return 1;
++
++	if (sdrv->id_table)
++		return !!serdev_match_id(sdrv->id_table, sdev);
++
++	return strcmp(sdev->modalias, drv->name) == 0;
+ }
+ 
+ /**
+@@ -488,7 +591,7 @@ struct serdev_controller *serdev_controller_alloc(struct device *parent,
+ 	if (!ctrl)
+ 		return NULL;
+ 
+-	id = ida_simple_get(&ctrl_ida, 0, 0, GFP_KERNEL);
++	id = idr_alloc(&ctrl_idr, ctrl, 0, 0, GFP_KERNEL);
+ 	if (id < 0) {
+ 		dev_err(parent,
+ 			"unable to allocate serdev controller identifier.\n");
+@@ -751,22 +854,22 @@ int serdev_controller_add(struct serdev_controller *ctrl)
+ 	pm_runtime_enable(&ctrl->dev);
+ 
+ 	ret_of = of_serdev_register_devices(ctrl);
++	if (!ret_of)
++		goto out_dev_ok;
++
+ 	ret_acpi = acpi_serdev_register_devices(ctrl);
+-	if (ret_of && ret_acpi) {
+-		dev_dbg(&ctrl->dev, "no devices registered: of:%pe acpi:%pe\n",
+-			ERR_PTR(ret_of), ERR_PTR(ret_acpi));
+-		ret = -ENODEV;
+-		goto err_rpm_disable;
+-	}
++	if (!ret_acpi)
++		goto out_dev_ok;
+ 
++	dev_dbg(&ctrl->dev, "no devices registered: of:%d acpi:%d\n",
++			ret_of, ret_acpi);
++	device_del(&ctrl->dev);
++	return -ENODEV;
++
++out_dev_ok:
+ 	dev_dbg(&ctrl->dev, "serdev%d registered: dev:%p\n",
+ 		ctrl->nr, &ctrl->dev);
+ 	return 0;
+-
+-err_rpm_disable:
+-	pm_runtime_disable(&ctrl->dev);
+-	device_del(&ctrl->dev);
+-	return ret;
+ };
+ EXPORT_SYMBOL_GPL(serdev_controller_add);
+ 
+@@ -800,6 +903,29 @@ void serdev_controller_remove(struct serdev_controller *ctrl)
+ }
+ EXPORT_SYMBOL_GPL(serdev_controller_remove);
+ 
++struct serdev_controller *serdev_get_controller(int nr)
++{
++	struct serdev_controller *ctrl;
++
++	ctrl = idr_find(&ctrl_idr, nr);
++	if (!ctrl)
++		return NULL;
++
++	get_device(&ctrl->dev);
++
++	return ctrl;
++}
++EXPORT_SYMBOL_GPL(serdev_get_controller);
++
++void serdev_put_controller(struct serdev_controller *ctrl)
++{
++	if (!ctrl)
++		return;
++
++	put_device(&ctrl->dev);
++}
++EXPORT_SYMBOL_GPL(serdev_put_controller);
++
+ /**
+  * serdev_driver_register() - Register client driver with serdev core
+  * @sdrv:	client driver to be associated with client-device.
+@@ -822,7 +948,7 @@ EXPORT_SYMBOL_GPL(__serdev_device_driver_register);
+ static void __exit serdev_exit(void)
+ {
+ 	bus_unregister(&serdev_bus_type);
+-	ida_destroy(&ctrl_ida);
++	idr_destroy(&ctrl_idr);
+ }
+ module_exit(serdev_exit);
+ 
+diff --git a/drivers/tty/serdev/serdev-ttydev.c b/drivers/tty/serdev/serdev-ttydev.c
+new file mode 100644
+index 000000000000..1cdf0d0e37a6
+--- /dev/null
++++ b/drivers/tty/serdev/serdev-ttydev.c
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2018 Ricardo Ribalda <ricardo.ribalda@gmail.com>
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/serdev.h>
++#include <linux/tty.h>
++#include <linux/of.h>
++#include "serport.h"
++
++static int ttydev_serdev_probe(struct serdev_device *serdev)
++{
++	struct serdev_controller *ctrl = serdev->ctrl;
++	struct serport *serport;
++	struct device *dev;
++    const struct tty_port_client_operations *serdev_ops;
++    
++
++	if (!ctrl->is_ttyport)
++		return -ENODEV;
++
++	serport = serdev_controller_get_drvdata(ctrl);
++
++    serdev_ops = serport->port->client_ops;
++
++    dev = tty_register_device_attr(serport->tty_drv, serport->tty_idx,
++                                      ctrl->dev.parent, NULL, NULL);
++
++    if (IS_ERR(dev))
++            serport->port->client_ops = serdev_ops;
++    else
++            serdev_device_set_drvdata(serdev, (void *)serdev_ops);
++
++	dev = tty_register_device_attr(serport->tty_drv, serport->tty_idx,
++					&serdev->dev, NULL, NULL);
++
++	return dev ? 0 : PTR_ERR(dev);
++}
++
++static void ttydev_serdev_remove(struct serdev_device *serdev)
++{
++	struct serdev_controller *ctrl = serdev->ctrl;
++	struct serport *serport;
++
++	serport = serdev_controller_get_drvdata(ctrl);
++    serport->port->client_ops = serdev_device_get_drvdata(serdev);
++	tty_unregister_device(serport->tty_drv, serport->tty_idx);
++}
++
++#ifdef CONFIG_OF
++static const struct of_device_id ttydev_of_match[] = {
++	{ .compatible = "ttydev" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, ttydev_of_match);
++#endif
++
++static const struct serdev_device_id ttydev_serdev_id[] = {
++	{ "ttydev", },
++	{ "ttydev_serdev", },
++	{}
++};
++MODULE_DEVICE_TABLE(serdev, ttydev_serdev_id);
++
++static struct serdev_device_driver ttydev_serdev_driver = {
++	.probe = ttydev_serdev_probe,
++	.remove = ttydev_serdev_remove,
++	.driver = {
++		.name = "ttydev_serdev",
++		.of_match_table	= of_match_ptr(ttydev_of_match),
++	},
++	.id_table = ttydev_serdev_id,
++};
++
++module_serdev_device_driver(ttydev_serdev_driver);
++
++MODULE_AUTHOR("Ricardo Ribalda <ricardo.ribalda@gmail.com>");
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Serdev to ttydev module");
+\ No newline at end of file
+diff --git a/drivers/tty/serdev/serdev-ttyport.c b/drivers/tty/serdev/serdev-ttyport.c
+index d367803e2044..dbdb052e2172 100644
+--- a/drivers/tty/serdev/serdev-ttyport.c
++++ b/drivers/tty/serdev/serdev-ttyport.c
+@@ -8,15 +8,9 @@
+ #include <linux/tty_driver.h>
+ #include <linux/poll.h>
+ 
+-#define SERPORT_ACTIVE		1
++#include "serport.h"
+ 
+-struct serport {
+-	struct tty_port *port;
+-	struct tty_struct *tty;
+-	struct tty_driver *tty_drv;
+-	int tty_idx;
+-	unsigned long flags;
+-};
++#define SERPORT_ACTIVE		1
+ 
+ /*
+  * Callback functions from the tty port.
+@@ -282,6 +276,7 @@ struct device *serdev_tty_port_register(struct tty_port *port,
+ 	serport->tty_drv = drv;
+ 
+ 	ctrl->ops = &ctrl_ops;
++	ctrl->is_ttyport = true;
+ 
+ 	port->client_ops = &client_ops;
+ 	port->client_data = ctrl;
+diff --git a/drivers/tty/serdev/serport.h b/drivers/tty/serdev/serport.h
+new file mode 100644
+index 000000000000..b43fa4fd541e
+--- /dev/null
++++ b/drivers/tty/serdev/serport.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2016-2017 Linaro Ltd., Rob Herring <robh@kernel.org>
++ */
++#ifndef _SERPORT_H
++#define _SERPORT_H
++
++struct serport {
++	struct tty_port *port;
++	struct tty_struct *tty;
++	struct tty_driver *tty_drv;
++	int tty_idx;
++	unsigned long flags;
++};
++
++#endif
+\ No newline at end of file
+diff --git a/include/linux/mod_devicetable.h b/include/linux/mod_devicetable.h
+index 5b08a473cdba..1f7bfe6fe025 100644
+--- a/include/linux/mod_devicetable.h
++++ b/include/linux/mod_devicetable.h
+@@ -496,6 +496,16 @@ struct spi_device_id {
+ 	kernel_ulong_t driver_data;	/* Data private to the driver */
+ };
+ 
++/* serdev */
++
++#define SERDEV_NAME_SIZE	32
++#define SERDEV_MODULE_PREFIX	"serdev:"
++
++struct serdev_device_id {
++	char name[SERDEV_NAME_SIZE];
++	kernel_ulong_t driver_data;	/* Data private to the driver */
++};
++
+ /* SLIMbus */
+ 
+ #define SLIMBUS_NAME_SIZE	32
+diff --git a/include/linux/serdev.h b/include/linux/serdev.h
+index 9f14f9c12ec4..fb06d1ca39e7 100644
+--- a/include/linux/serdev.h
++++ b/include/linux/serdev.h
+@@ -9,6 +9,7 @@
+ #include <linux/device.h>
+ #include <linux/termios.h>
+ #include <linux/delay.h>
++#include <linux/mod_devicetable.h>
+ 
+ struct serdev_controller;
+ struct serdev_device;
+@@ -45,6 +46,7 @@ struct serdev_device {
+ 	const struct serdev_device_ops *ops;
+ 	struct completion write_comp;
+ 	struct mutex write_lock;
++	char modalias[SERDEV_NAME_SIZE];
+ };
+ 
+ static inline struct serdev_device *to_serdev_device(struct device *d)
+@@ -60,6 +62,7 @@ static inline struct serdev_device *to_serdev_device(struct device *d)
+  * @remove:	unbinds this driver from the serdev device.
+  */
+ struct serdev_device_driver {
++	const struct serdev_device_id *id_table;
+ 	struct device_driver driver;
+ 	int	(*probe)(struct serdev_device *);
+ 	void	(*remove)(struct serdev_device *);
+@@ -103,6 +106,7 @@ struct serdev_controller_ops {
+ struct serdev_controller {
+ 	struct device		dev;
+ 	unsigned int		nr;
++	bool				is_ttyport;
+ 	struct serdev_device	*serdev;
+ 	const struct serdev_controller_ops *ops;
+ };
+@@ -160,6 +164,9 @@ static inline void serdev_controller_put(struct serdev_controller *ctrl)
+ 		put_device(&ctrl->dev);
+ }
+ 
++const struct serdev_device_id *serdev_match_id(const struct serdev_device_id *id,
++		const struct serdev_device *sdev);
++
+ struct serdev_device *serdev_device_alloc(struct serdev_controller *);
+ int serdev_device_add(struct serdev_device *);
+ void serdev_device_remove(struct serdev_device *);
+@@ -167,6 +174,10 @@ void serdev_device_remove(struct serdev_device *);
+ struct serdev_controller *serdev_controller_alloc(struct device *, size_t);
+ int serdev_controller_add(struct serdev_controller *);
+ void serdev_controller_remove(struct serdev_controller *);
++void serdev_put_controller(struct serdev_controller *ctrl);
++struct serdev_controller *serdev_get_controller(int nr);
++struct serdev_device *serdev_controller_add_probed_device(struct serdev_controller *ctrl,
++					const char *name);
+ 
+ static inline void serdev_controller_write_wakeup(struct serdev_controller *ctrl)
+ {
+diff --git a/scripts/mod/devicetable-offsets.c b/scripts/mod/devicetable-offsets.c
+index 27007c18e754..7a77d3fc56bd 100644
+--- a/scripts/mod/devicetable-offsets.c
++++ b/scripts/mod/devicetable-offsets.c
+@@ -152,6 +152,9 @@ int main(void)
+ 	DEVID_FIELD(i3c_device_id, part_id);
+ 	DEVID_FIELD(i3c_device_id, extra_info);
+ 
++	DEVID(serdev_device_id);
++	DEVID_FIELD(serdev_device_id, name);
++	
+ 	DEVID(spi_device_id);
+ 	DEVID_FIELD(spi_device_id, name);
+ 
+diff --git a/scripts/mod/file2alias.c b/scripts/mod/file2alias.c
+index 2417dd1dee33..3b29c1d21ce0 100644
+--- a/scripts/mod/file2alias.c
++++ b/scripts/mod/file2alias.c
+@@ -919,6 +919,16 @@ static int do_i2c_entry(const char *filename, void *symval,
+ 	return 1;
+ }
+ 
++/* Looks like: serdev:S */
++static int do_serdev_entry(const char *filename, void *symval,
++			   char *alias)
++{
++	DEF_FIELD_ADDR(symval, serdev_device_id, name);
++	sprintf(alias, SERDEV_MODULE_PREFIX "%s", *name);
++
++	return 1;
++}
++
+ static int do_i3c_entry(const char *filename, void *symval,
+ 			char *alias)
+ {
+@@ -1419,6 +1429,7 @@ static const struct devtable devtable[] = {
+ 	{"vmbus", SIZE_hv_vmbus_device_id, do_vmbus_entry},
+ 	{"rpmsg", SIZE_rpmsg_device_id, do_rpmsg_entry},
+ 	{"i2c", SIZE_i2c_device_id, do_i2c_entry},
++	{"serdev", SIZE_serdev_device_id, do_serdev_entry},
+ 	{"i3c", SIZE_i3c_device_id, do_i3c_entry},
+ 	{"spi", SIZE_spi_device_id, do_spi_entry},
+ 	{"dmi", SIZE_dmi_system_id, do_dmi_entry},
+-- 
+2.25.1
+
