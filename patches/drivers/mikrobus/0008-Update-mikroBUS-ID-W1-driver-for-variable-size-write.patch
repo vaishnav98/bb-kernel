@@ -1,0 +1,203 @@
+From 9a3e984974c329ab2a0b906f70b9b731fb50b1ad Mon Sep 17 00:00:00 2001
+From: Vaishnav M A <vaishnav@beagleboard.org>
+Date: Tue, 15 Dec 2020 14:38:35 +0530
+Subject: [PATCH] Update mikroBUS ID W1 driver for variable size writes
+
+Signed-off-by: Vaishnav M A <vaishnav@beagleboard.org>
+---
+ drivers/misc/mikrobus/mikrobus_id.c | 121 ++++++++++++++++------------
+ 1 file changed, 70 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/misc/mikrobus/mikrobus_id.c b/drivers/misc/mikrobus/mikrobus_id.c
+index 533221e97aaf..e891645f745c 100644
+--- a/drivers/misc/mikrobus/mikrobus_id.c
++++ b/drivers/misc/mikrobus/mikrobus_id.c
+@@ -20,6 +20,7 @@
+ 
+ #define W1_MIKROBUS_ID_EEPROM_SIZE	1536
+ #define W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE	32
++#define W1_MIKROBUS_ID_EEPROM_VERIFY_SCRATCH_SIZE	35
+ #define W1_MIKROBUS_ID_READ_EEPROM	0xF0
+ #define W1_MIKROBUS_ID_EEPROM_READ_RETRIES	10
+ #define W1_MIKROBUS_ID_EEPROM_WRITE_RETRIES	5
+@@ -27,13 +28,12 @@
+ #define W1_MIKROBUS_ID_EEPROM_READ_SCRATCH	0xAA
+ #define W1_MIKROBUS_ID_EEPROM_COPY_SCRATCH	0x55
+ #define W1_MIKROBUS_ID_EEPROM_COPY_SCRATCH_ES	0x40
+-
+-#define W1_MIKROBUS_ID_EEPROM_TPROG_MS		25
++#define W1_MIKROBUS_ID_EEPROM_TPROG_MS		20
+ 
+ static int w1_mikrobus_id_readblock(struct w1_slave *sl, int off, int count, char *buf)
+ {
+ 	u8 wrbuf[3];
+-	u8 cmp[W1_MIKROBUS_ID_EEPROM_SIZE];
++	u8 *cmp;
+ 	int tries = W1_MIKROBUS_ID_EEPROM_READ_RETRIES;
+ 	
+ 	do {
+@@ -41,70 +41,91 @@ static int w1_mikrobus_id_readblock(struct w1_slave *sl, int off, int count, cha
+ 		wrbuf[1] = count >> 8;
+ 		wrbuf[2] = count & 0xFF;
+ 
+-		w1_reset_select_slave(sl);
++		if (w1_reset_select_slave(sl))
++				return -1;
+ 		w1_write_block(sl->master, wrbuf, 3);
+ 		w1_read_block(sl->master, buf, count);
+ 
+-		w1_reset_select_slave(sl);
++		if (w1_reset_select_slave(sl))
++				return -1;
++		cmp = kzalloc(count, GFP_KERNEL);
++		if (!cmp)
++			return -ENOMEM;
+ 		w1_write_block(sl->master, wrbuf, 3);
+ 		w1_read_block(sl->master, cmp, count);
+-
+-		if (!memcmp(cmp, buf, count))
++		if (!memcmp(cmp, buf, count)){
++			kfree(cmp);
+ 			return 0;
++		}
+ 	} while (--tries);
+ 
+ 	dev_err(&sl->dev, "proof reading failed %d times\n",
+ 			W1_MIKROBUS_ID_EEPROM_READ_RETRIES);
++	kfree(cmp);
+ 	return -EIO;
+ }
+ 
+-static int w1_mikrobus_id_writeblock(struct w1_slave *sl, int off, int count, char *buf)
++static int w1_mikrobus_id_movescratch(struct w1_slave *sl, int addr, char *buf)
+ {
+ 	u8 wrbuf[4];
+-	u8 wrdata[W1_MIKROBUS_ID_EEPROM_SIZE];
+-	u8 scratchpad_verify[W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE + 3];
++	u8 scratchpad_verify[W1_MIKROBUS_ID_EEPROM_VERIFY_SCRATCH_SIZE];
+ 	u8 write_scratchpad_crc[2];
+-	u16 wraddr = 0;
+-	u16 len = W1_MIKROBUS_ID_EEPROM_SIZE;
+ 	int verify_status;
++	int tries;
++
++	wrbuf[0] = W1_MIKROBUS_ID_EEPROM_WRITE_SCRATCH;
++	wrbuf[1] = addr >> 8;
++	wrbuf[2] = addr & 0xFF;
++
++	tries = W1_MIKROBUS_ID_EEPROM_WRITE_RETRIES;
++	do {
++		if (w1_reset_select_slave(sl))
++			return -1;
++		w1_write_block(sl->master, wrbuf, 3);
++		w1_write_block(sl->master, buf, W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE);
++		udelay(100); /* delay for CRC calculation at slave */
++		w1_read_block(sl->master, write_scratchpad_crc, 2);
++		if (w1_reset_select_slave(sl))
++			return -1;
++		w1_write_8(sl->master, W1_MIKROBUS_ID_EEPROM_READ_SCRATCH);
++		w1_read_block(sl->master, scratchpad_verify, W1_MIKROBUS_ID_EEPROM_VERIFY_SCRATCH_SIZE);
++		verify_status = memcmp(buf, scratchpad_verify + 3, W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE);
++	} while(verify_status && --tries);
++
++	if(!tries && verify_status){
++		dev_err(&sl->dev, "verify scratchpad failed %d times\n",
++			W1_MIKROBUS_ID_EEPROM_WRITE_RETRIES);
++		return -EIO;
++	}
++		
++	wrbuf[0] = W1_MIKROBUS_ID_EEPROM_COPY_SCRATCH;
++	wrbuf[1] = addr >> 8;
++	wrbuf[2] = addr & 0xFF;
++	wrbuf[3] = W1_MIKROBUS_ID_EEPROM_COPY_SCRATCH_ES;
++	if (w1_reset_select_slave(sl))
++			return -1;
++	w1_write_block(sl->master, wrbuf, 4);
++	msleep(W1_MIKROBUS_ID_EEPROM_TPROG_MS);
++	return 0;
++}
+ 
+-	memcpy(wrdata, buf, W1_MIKROBUS_ID_EEPROM_SIZE);
++static int w1_mikrobus_id_writeblock(struct w1_slave *sl, int off, int count, char *buf)
++{
++	u16 wraddr = 0;
++	u16 len = count - (count % W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE);
++	u8 scratchpad_write[W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE];
+ 
+ 	while(len > 0) {
+-		wrbuf[0] = W1_MIKROBUS_ID_EEPROM_WRITE_SCRATCH;
+-		wrbuf[1] = wraddr >> 8;
+-		wrbuf[2] = wraddr & 0xFF;
+-
+-		int tries = W1_MIKROBUS_ID_EEPROM_WRITE_RETRIES;
+-		do {
+-			w1_reset_select_slave(sl);
+-			w1_write_block(sl->master, wrbuf, 3);
+-			w1_write_block(sl->master, wrdata + wraddr, W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE);
+-			udelay(100);
+-			w1_read_block(sl->master, write_scratchpad_crc, 2);
+-			w1_reset_select_slave(sl);
+-			w1_write_8(sl->master, W1_MIKROBUS_ID_EEPROM_READ_SCRATCH);
+-			w1_read_block(sl->master, scratchpad_verify, W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE + 3);
+-			verify_status = memcmp(wrdata + wraddr, scratchpad_verify + 3, W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE);
+-		} while(verify_status && --tries);
+-
+-		if(!tries & verify_status){
+-			dev_err(&sl->dev, "verify scratchpad failed %d times\n",
+-				W1_MIKROBUS_ID_EEPROM_WRITE_RETRIES);
+-			return -EIO;
+-		}
+-			
+-		wrbuf[0] = W1_MIKROBUS_ID_EEPROM_COPY_SCRATCH;
+-		wrbuf[1] = wraddr >> 8;
+-		wrbuf[2] = wraddr & 0xFF;
+-		wrbuf[3] = W1_MIKROBUS_ID_EEPROM_COPY_SCRATCH_ES;
+-		w1_reset_select_slave(sl);
+-		w1_write_block(sl->master, wrbuf, 4);
+-
+-		msleep(W1_MIKROBUS_ID_EEPROM_TPROG_MS);
++		w1_mikrobus_id_movescratch(sl, wraddr, buf + wraddr);
+ 		wraddr += W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE;
+ 		len -= W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE;
+ 	}
++
++	if(count % W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE){
++		memcpy(scratchpad_write, buf + wraddr, count % W1_MIKROBUS_ID_EEPROM_SCRATCH_SIZE);
++		w1_mikrobus_id_movescratch(sl, wraddr, scratchpad_write);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -113,11 +134,12 @@ static int w1_mikrobus_id_nvmem_read(void *priv, unsigned int off, void *buf, si
+ 	struct w1_slave *sl = priv;
+ 	int ret;
+ 
+-	if (off > W1_MIKROBUS_ID_EEPROM_SIZE)
++	/* mikroBUS ID EEPROM does not support reading from offsets */
++	if (off)
+ 		return -EINVAL;
+ 
+-	if ((off + count) > W1_MIKROBUS_ID_EEPROM_SIZE)
+-		count = W1_MIKROBUS_ID_EEPROM_SIZE - off;
++	if (count > W1_MIKROBUS_ID_EEPROM_SIZE)
++		return -EINVAL;
+ 
+ 	mutex_lock(&sl->master->bus_mutex);
+ 	ret = w1_mikrobus_id_readblock(sl, off, count, buf);
+@@ -131,11 +153,8 @@ static int w1_mikrobus_id_nvmem_write(void *priv, unsigned int off, void *buf, s
+ 	struct w1_slave *sl = priv;
+ 	int ret;
+ 
+-	if (off > W1_MIKROBUS_ID_EEPROM_SIZE)
+-		return -EINVAL;
+-
+ 	if ((off + count) > W1_MIKROBUS_ID_EEPROM_SIZE)
+-		count = W1_MIKROBUS_ID_EEPROM_SIZE - off;
++		return -EINVAL;
+ 
+ 	mutex_lock(&sl->master->bus_mutex);
+ 	ret = w1_mikrobus_id_writeblock(sl, off, count, buf);
+-- 
+2.25.1
+
